@@ -6,22 +6,22 @@ from faker import Faker
 def generate_synthetic_security_alerts(
     NUM_ALERTS=8000,
     START_DATE=datetime(2023, 1, 1),
-    label_noise=0.10,      # 10% random label flips
-    feature_noise=0.50,    # 50% jitter on continuous features
-    login_missing=0.10,    # 10% missingness in login_attempts
-    source_ip_missing=0.52,# 52% missingness in source_ip
+    label_noise=0.10,       # 10% random label flips
+    feature_noise=0.50,     # 50% jitter on continuous features
+    login_missing=0.10,     # 10% missingness in login_attempts
+    source_ip_missing=0.52, # 52% missingness in source_ip
     random_seed=42
 ) -> pd.DataFrame:
     """
     Generates a synthetic security alerts dataset with:
      - alert_id
-     - separate date & time columns
-     - realistic timestamp burstiness
-     - label noise
-     - heavy feature overlap + jitter
+     - timestamp (standard datetime)
+     - incident_priority with label noise
+     - alert_type
      - realistic, skewed & multimodal CPU/memory usage distributions
-     - geolocation, alert_type
      - missingness in login_attempts and source_ip
+     - geolocation as country
+     - outcome, remediation time
     """
     np.random.seed(random_seed)
     fake = Faker()
@@ -40,27 +40,23 @@ def generate_synthetic_security_alerts(
     base_probs = [0.75, 0.20, 0.04, 0.01]
     incident_priority = np.random.choice(priors, size=NUM_ALERTS, p=base_probs)
     flip = np.random.rand(NUM_ALERTS) < label_noise
-    incident_priority[flip] = np.random.choice(priors, size=flip.sum(), p=base_probs)
+    if flip.any():
+        incident_priority[flip] = np.random.choice(priors, size=flip.sum(), p=base_probs)
 
     # 3) Alert types
     alert_types = ['Phishing','Malware','Brute Force','DDoS','Data Exfiltration']
     alert_probs = [0.3, 0.3, 0.2, 0.15, 0.05]
     alert_type = np.random.choice(alert_types, size=NUM_ALERTS, p=alert_probs)
 
-    # 4) Build base DataFrame
+    # 4) Base DataFrame
     df = pd.DataFrame({
-        'alert_id': [f"ALERT_{i:07d}" for i in range(1, NUM_ALERTS+1)],
-        'timestamp': timestamps,
+        'alert_id':          [f"ALERT_{i:07d}" for i in range(1, NUM_ALERTS+1)],
+        'timestamp':         timestamps,
         'incident_priority': incident_priority,
-        'alert_type': alert_type
+        'alert_type':        alert_type
     })
 
-    # split timestamp into date & time
-    df['date'] = df['timestamp'].dt.date.astype(str)
-    df['time'] = df['timestamp'].dt.time.astype(str)
-    df.drop(columns=['timestamp'], inplace=True)
-
-    # Helper: per-category + jitter
+    # helper: sample with jitter
     def sample_cond(cats, mapping):
         arr = np.empty(len(cats), dtype=float)
         for cat, fn in mapping.items():
@@ -69,7 +65,7 @@ def generate_synthetic_security_alerts(
         arr += np.random.normal(0, np.nanstd(arr)*feature_noise, size=len(arr))
         return arr
 
-    # 5) CVE score ∈ [0,10]
+    # 5) CVE score [0,10]
     cve_map = {
         'Low':      lambda n: np.random.beta(1,2,n)*5,
         'Medium':   lambda n: np.random.beta(2,2,n)*7,
@@ -78,7 +74,7 @@ def generate_synthetic_security_alerts(
     }
     df['cve_score'] = sample_cond(df['incident_priority'], cve_map).clip(0,10).round(1)
 
-    # 6) IP reputation ∈ [0,100]
+    # 6) IP reputation [0,100]
     rep_map = {
         'Low':      lambda n: np.random.beta(3,1,n)*80,
         'Medium':   lambda n: np.random.beta(2,2,n)*80 + 10,
@@ -87,7 +83,7 @@ def generate_synthetic_security_alerts(
     }
     df['ip_reputation_score'] = sample_cond(df['incident_priority'], rep_map).clip(0,100).round(1)
 
-    # 7) Login attempts + 10% missing
+    # 7) Login attempts + missingness
     login_map = {
         'Low':      lambda n: np.random.poisson(1,n),
         'Medium':   lambda n: np.random.poisson(5,n),
@@ -98,12 +94,10 @@ def generate_synthetic_security_alerts(
     mask_login = np.random.rand(NUM_ALERTS) < login_missing
     df.loc[mask_login, 'login_attempts'] = np.nan
 
-    # 8) CPU & memory: skewed + diurnal + spikes
-    hours = pd.to_datetime(df['date'] + ' ' + df['time']).dt.hour.values
+    # 8) CPU & Memory usage: skewed, diurnal, spikes
+    # extract hour
+    hours = pd.to_datetime(df['timestamp']).dt.hour.values
     diurnal = 10 * np.sin(2*np.pi*hours/24) + 10
-
-    def base_sampler(cat, n, dist_map):
-        return dist_map[cat](n)
 
     cpu_params = {'Low':(2,5),'Medium':(4,4),'High':(5,2),'Critical':(2,1)}
     mem_params = {'Low':(3,4),'Medium':(5,3),'High':(6,2),'Critical':(7,1)}
@@ -117,7 +111,7 @@ def generate_synthetic_security_alerts(
 
     # random spikes
     spike_prob = {'Low':0.01,'Medium':0.02,'High':0.05,'Critical':0.10}
-    spike_amt = {'Low':(5,15),'Medium':(10,30),'High':(20,50),'Critical':(30,70)}
+    spike_amt  = {'Low':(5,15),'Medium':(10,30),'High':(20,50),'Critical':(30,70)}
     for i, cat in enumerate(df['incident_priority']):
         if np.random.rand()<spike_prob[cat]:
             cpu[i] = min(100, cpu[i] + np.random.uniform(*spike_amt[cat]))
@@ -132,16 +126,16 @@ def generate_synthetic_security_alerts(
     # 9) Payload size
     def payload_sampler(cat,n):
         base = {'Low':800,'Medium':1200,'High':2000,'Critical':2500}[cat]
-        return np.random.lognormal(mean=np.log(base), sigma=0.8, size=n)
+        return np.random.lognormal(np.log(base), 0.8, size=n)
     pay = np.zeros(NUM_ALERTS)
     for cat in priors:
         idx = df.index[df['incident_priority']==cat]
-        pay[idx] = payload_sampler(cat,len(idx))
+        pay[idx] = payload_sampler(cat, len(idx))
     pay += np.random.normal(0, np.nanstd(pay)*feature_noise, NUM_ALERTS)
     df['payload_size'] = np.clip(pay,0,None).round().astype(int)
 
     # 10) Contextual fields
-    # 10a) source_ip + 52% missing
+    # 10a) source_ip + missingness
     df['source_ip'] = [fake.ipv4() for _ in range(NUM_ALERTS)]
     mask_ip = np.random.rand(NUM_ALERTS) < source_ip_missing
     df.loc[mask_ip, 'source_ip'] = np.nan
@@ -156,8 +150,8 @@ def generate_synthetic_security_alerts(
         p=[0.2,0.3,0.2,0.2,0.1], size=NUM_ALERTS
     )
 
-    # 11) Geolocation
-    df['geolocation'] = [f"{fake.latitude()},{fake.longitude()}" for _ in range(NUM_ALERTS)]
+    # 11) Geolocation as country
+    df['geolocation'] = [fake.country() for _ in range(NUM_ALERTS)]
 
     # 12) Outcome & remediation time
     df['outcome'] = df['incident_priority'].map({
@@ -168,12 +162,12 @@ def generate_synthetic_security_alerts(
         scale=df['cve_score']*2 + 1, size=NUM_ALERTS
     ).round(1)
 
-    # 13) Shuffle and return
+    # 13) Shuffle rows
     return df.sample(frac=1, random_state=random_seed).reset_index(drop=True)
 
 
 if __name__ == '__main__':
     df = generate_synthetic_security_alerts()
     df.to_csv('synthetic_security_alerts.csv', index=False)
-    print("Dataset generated:", df.shape)
+    print("Generated dataset:", df.shape)
     print(df.head())
