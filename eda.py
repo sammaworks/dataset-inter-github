@@ -8,7 +8,7 @@ from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 
 def preprocess_and_eda(
-    input_csv: str = 'synthetic_security_alerts.csv',
+    input_csv: str = 'security_alerts_July2025.csv',
     test_size: float = 0.2,
     random_seed: int = 42
 ):
@@ -39,11 +39,11 @@ def preprocess_and_eda(
     numeric_feats = [
         'cve_score', 'ip_reputation_score', 'login_attempts',
         'cpu_usage_percent', 'memory_usage_percent', 'payload_size',
-        'time_to_remediate_hours', 'hour', 'is_weekend'
+         'hour', 'is_weekend'
     ]
-    categorical_feats = [
+    categorical_feats = [ 
         'incident_priority', 'user_role', 'system_context',
-        'weekday', 'outcome'
+        'weekday'
     ]
 
     # Preprocessing Pipeline

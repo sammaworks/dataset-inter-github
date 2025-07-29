@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, mean_absolute_error, cohen_kappa_sco
 # Ordinal models
 from mord import LogisticIT, OrdinalRidge
 
-def load_and_engineer(path='synthetic_security_alerts.csv'):
+def load_and_engineer(path='security_alerts_July2025.csv'):
     df = pd.read_csv(path, parse_dates=['timestamp'])
     df['hour']       = df['timestamp'].dt.hour
     df['weekday']    = df['timestamp'].dt.day_name()
@@ -24,7 +24,7 @@ def prepare_data(df):
     priority_map = {'Low':0, 'Medium':1, 'High':2, 'Critical':3}
     df['priority_ord'] = df['incident_priority'].map(priority_map)
     
-    X = df.drop(columns=['timestamp','source_ip','incident_priority','outcome','priority_ord'])
+    X = df.drop(columns=['timestamp','source_ip','incident_priority','priority_ord'])
     y = df['priority_ord']
     return train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
@@ -32,7 +32,7 @@ def build_preprocessor():
     numeric_feats = [
         'cve_score','ip_reputation_score','login_attempts',
         'cpu_usage_percent','memory_usage_percent','payload_size',
-        'time_to_remediate_hours','hour','is_weekend'
+        'hour','is_weekend'
     ]
     categorical_feats = ['user_role','system_context','weekday']
     
