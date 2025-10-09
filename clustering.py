@@ -1,96 +1,98 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
-from kmodes.kprototypes import KPrototypes
-from sklearn.decomposition import PCA
+# models.py (SQLAlchemy 2.x style)
+from __future__ import annotations
+from typing import List, Optional
+from sqlalchemy import (
+    Integer, String, DateTime, Index, UniqueConstraint, PrimaryKeyConstraint,
+    ForeignKey, ForeignKeyConstraint, func
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-# Load the synthetic dataset
-df = pd.read_csv('synthetic_security_alerts.csv', parse_dates=['timestamp'])
+class Base(DeclarativeBase):
+    pass
 
-# Check if 'timestamp' is in the correct datetime format
-if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+class RepoInfo(Base):
+    __tablename__ = "repo_info"
 
-# Feature Engineering from timestamp
-df['hour']       = df['timestamp'].dt.hour
-df['weekday']    = df['timestamp'].dt.day_name()
-df['is_weekend'] = df['weekday'].isin(['Saturday', 'Sunday']).astype(int)
+    repo_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
+    repo_url: Mapped[str] = mapped_column(String, nullable=False)
+    local_path: Mapped[str] = mapped_column(String, nullable=False)
 
-# Ensure 'hour' and 'is_weekend' are created
-print(df[['timestamp', 'hour', 'weekday', 'is_weekend']].head())
+    latest_repo_snapshot: Mapped[Optional[str]] = mapped_column(String)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-# Define numeric and categorical features
-numeric_feats = [
-    'cve_score', 'ip_reputation_score', 'login_attempts',
-    'cpu_usage_percent', 'memory_usage_percent', 'payload_size',
-    'time_to_remediate_hours', 'hour', 'is_weekend'
-]
-categorical_feats = [
-    'incident_priority', 'user_role', 'system_context',
-    'weekday', 'outcome'
-]
+    __table_args__ = (
+        UniqueConstraint("repo_url", "local_path", name="repo_info_url_path_uc"),
+        Index("ix_repo_info_url", "repo_url"),
+        Index("ix_repo_info_local_path", "local_path"),
+    )
 
-# Preprocessing numeric features
-numeric_data = df[numeric_feats]
-scaler = StandardScaler()
-numeric_data_scaled = scaler.fit_transform(numeric_data)
+    sessions: Mapped[List["Session"]] = relationship(
+        back_populates="repo", cascade="all, delete-orphan", passive_deletes=True
+    )
+    histories: Mapped[List["RepoHistory"]] = relationship(
+        back_populates="repo", cascade="all, delete-orphan", passive_deletes=True
+    )
 
-# Preprocessing categorical features
-categorical_data = df[categorical_feats]
-label_encoders = {}
-for col in categorical_feats:
-    le = LabelEncoder()
-    categorical_data[col] = le.fit_transform(categorical_data[col].astype(str))
-    label_encoders[col] = le
+class Session(Base):
+    __tablename__ = "sessions"
 
-# Combine numeric and categorical data for clustering
-data_combined = np.concatenate([numeric_data_scaled, categorical_data], axis=1)
+    session_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repo_info.repo_id", ondelete="CASCADE"), index=True, nullable=False)
 
-# Indices for categorical data (for KPrototypes)
-categorical_indices = list(range(len(numeric_feats), len(numeric_feats) + len(categorical_feats)))
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-# Run K-Prototypes clustering
-kproto = KPrototypes(n_clusters=4, init='Cao', n_init=10, verbose=2)
-clusters = kproto.fit_predict(data_combined, categorical=categorical_indices)
+    repo: Mapped["RepoInfo"] = relationship(back_populates="sessions")
+    commands: Mapped[List["CommandHistory"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", passive_deletes=True
+    )
 
-# Add the cluster labels to the dataframe
-df['Cluster'] = clusters
+class RepoHistory(Base):
+    __tablename__ = "repo_history"
 
-# 1. Visualize the clusters in a 2D plane using PCA
-pca = PCA(n_components=2)
-reduced_data = pca.fit_transform(numeric_data_scaled)
+    repo_id: Mapped[int] = mapped_column(ForeignKey("repo_info.repo_id", ondelete="CASCADE"), index=True, nullable=False)
+    commit_hash: Mapped[str] = mapped_column(String, nullable=False)
 
-plt.figure(figsize=(10, 6))
-sns.scatterplot(x=reduced_data[:, 0], y=reduced_data[:, 1], hue=df['Cluster'], palette="Set2", s=60)
-plt.title('Clustering with K-Prototypes (PCA-reduced)')
-plt.xlabel('PCA Component 1')
-plt.ylabel('PCA Component 2')
-plt.show()
+    repo_snapshot: Mapped[Optional[str]] = mapped_column(String)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-# 2. Show the cluster centers (for numeric features)
-centers = kproto.cluster_centroids_[:len(numeric_feats)]
-centers_df = pd.DataFrame(centers, columns=numeric_feats)
-print("\nCluster Centers (Numeric Features):")
-print(centers_df)
+    __table_args__ = (
+        PrimaryKeyConstraint("repo_id", "commit_hash", name="repo_history_pk"),
+        Index("ix_repo_history_commit", "commit_hash"),
+    )
 
-# 3. Show cluster distributions for categorical features
-for col in categorical_feats:
-    plt.figure(figsize=(10, 6))
-    sns.countplot(x='Cluster', hue=col, data=df, palette="Set2")
-    plt.title(f'{col} distribution by cluster')
-    plt.xlabel('Cluster')
-    plt.ylabel('Count')
-    plt.show()
+    repo: Mapped["RepoInfo"] = relationship(back_populates="histories")
+    commands: Mapped[List["CommandHistory"]] = relationship(
+        back_populates="repo_history", cascade="all, delete-orphan", passive_deletes=True
+    )
 
-# 4. Cluster profiling: inspect the clusters
-print("\nCluster Profiling (Cluster mean values):")
-print(df.groupby('Cluster')[numeric_feats].mean())
+class CommandHistory(Base):
+    __tablename__ = "command_history"
 
-# 5. Save the clustering result
-df.to_csv('synthetic_security_alerts_with_clusters.csv', index=False)
+    command_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.session_id", ondelete="CASCADE"), index=True, nullable=False)
 
-print("\nCluster analysis complete. Clustered dataset saved as 'synthetic_security_alerts_with_clusters.csv'.")
+    command: Mapped[str] = mapped_column(String, nullable=False)
+    output: Mapped[Optional[str]] = mapped_column(String)
+
+    # exact repo state linkage
+    repo_id: Mapped[int] = mapped_column(nullable=False)
+    commit_hash: Mapped[str] = mapped_column(String, nullable=False)
+
+    executed_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["repo_id", "commit_hash"],
+            ["repo_history.repo_id", "repo_history.commit_hash"],
+            ondelete="CASCADE",
+            name="fk_command_repo_history",
+        ),
+        Index("ix_command_history_session_id", "session_id"),
+        Index("ix_command_history_repo_commit", "repo_id", "commit_hash"),
+    )
+
+    session: Mapped["Session"] = relationship(back_populates="commands")
+    repo_history: Mapped["RepoHistory"] = relationship(back_populates="commands")
