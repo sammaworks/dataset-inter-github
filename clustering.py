@@ -1,246 +1,251 @@
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
-from math import sqrt
 import numpy as np
 import pandas as pd
 
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.linear_model import RidgeCV
+from sklearn.metrics import mean_squared_error
+from scipy.stats import spearmanr
+from math import sqrt
 
 
-class ModelData:
-
-    # ... your existing methods (including apply_sarimax) ...
-
-    @staticmethod
-    def _build_lstm_sequences(X_arr, y_arr, idx_arr, lookback):
-        """
-        Internal helper: create [samples, timesteps, features] and aligned y, index.
-        """
-        X_seq, y_seq, idx_seq = [], [], []
-
-        for t in range(lookback, len(X_arr)):
-            X_seq.append(X_arr[t - lookback:t, :])
-            y_seq.append(y_arr[t])
-            idx_seq.append(idx_arr[t])
-
-        return np.array(X_seq), np.array(y_seq), np.array(idx_seq)
-
-    @staticmethod
-    def apply_lstm(
+def apply_sarimax_regularized(
         train_df,
         test_df,
         benchmark,
         split_point,
-        lstm_model_parameters,
-        print_model_parameters: bool = False,
-        print_comparision_plot: bool = False,
-        print_evaluation_matrix: bool = False,
-    ):
-        """
-        LSTM baseline using (benchmark, exogenous features) over a rolling window.
+        order_grid,
+        seasonal_order_grid,
+        use_bic=False,
+        print_model_parameters=False,
+        print_comparision_plot=False,
+        print_evaluation_matrix=False
+):
+    """
+    Regularized SARIMAX for time series with many exogenous variables.
 
-        train_df, test_df : exogenous features (DataFrames with DateTimeIndex)
-        benchmark         : target series (pd.Series)
-        split_point       : last date of training (Timestamp / str)
-        lstm_model_parameters : dict or dataclass.asdict with keys:
-            - lookback (int, e.g. 12)
-            - epochs (int, e.g. 100)
-            - batch_size (int, e.g. 16)
-            - units (int, e.g. 32)
-            - dropout (float, e.g. 0.2)
-            - val_split (float, e.g. 0.2)
-            - patience (int, e.g. 10)
-            - verbose (0/1/2)
-        """
+    Idea:
+      1) Use RidgeCV on the exogenous variables (X) to compress them into a
+         single regularized index x_reg(t) = f(X_t).
+      2) Fit SARIMAX on y_t with this 1-dim exogenous regressor.
+      3) Choose SARIMA orders via AIC or BIC (IC = likelihood – penalty*k).
 
-        # -----------------------------
-        # 1. Unpack LSTM hyperparams
-        # -----------------------------
-        lookback = lstm_model_parameters.get("lookback", 12)
-        epochs = lstm_model_parameters.get("epochs", 100)
-        batch_size = lstm_model_parameters.get("batch_size", 16)
-        units = lstm_model_parameters.get("units", 32)
-        dropout = lstm_model_parameters.get("dropout", 0.2)
-        val_split = lstm_model_parameters.get("val_split", 0.2)
-        patience = lstm_model_parameters.get("patience", 10)
-        verbose = lstm_model_parameters.get("verbose", 1)
+    Args
+    ----
+    train_df : pd.DataFrame
+        Exogenous variables for the training period (before split_point).
+    test_df : pd.DataFrame
+        Exogenous variables for the testing period (starting at split_point).
+    benchmark : pd.Series
+        Target series (full period; same index as train_df+test_df).
+    split_point : str or pd.Timestamp
+        Date index where train ends and test begins (inclusive for test).
+    order_grid : list of tuple
+        List of (p,d,q) tuples to try, e.g. [(0,1,1), (1,1,1), (2,1,1)].
+    seasonal_order_grid : list of tuple
+        List of seasonal (P,D,Q,s) tuples to try, e.g. [(0,0,0,0), (0,1,1,12)].
+    use_bic : bool
+        If True, select model by BIC; else by AIC.
+    print_model_parameters : bool
+        If True, print summary of the final SARIMAX model.
+    print_comparision_plot : bool
+        If True, plot Predicted vs Benchmark with a vertical split line.
+    print_evaluation_matrix : bool
+        If True, print RMSE and correlations for train/test/overall.
 
-        split_point_ts = pd.to_datetime(split_point)
+    Returns
+    -------
+    result_df : pd.DataFrame
+        DataFrame indexed by time with columns:
+        ['Predicted', 'Benchmark'] for the full period.
+    """
 
-        # -----------------------------
-        # 2. Align full X (train+test) and y
-        # -----------------------------
-        X_full = pd.concat([train_df, test_df], axis=0).sort_index()
-        y_full = benchmark.sort_index()
+    # ------------------------------------------------------------------
+    # 1) Split target into train/test and ensure DataFrame shapes
+    # ------------------------------------------------------------------
+    benchmark_train = benchmark.loc[:split_point]
+    benchmark_test = benchmark.loc[split_point:]
 
-        common_idx = X_full.index.intersection(y_full.index)
-        X_full = X_full.loc[common_idx]
-        y_full = y_full.loc[common_idx]
+    if isinstance(train_df, pd.Series):
+        train_df = train_df.to_frame()
+    if isinstance(test_df, pd.Series):
+        test_df = test_df.to_frame()
 
-        # Raw arrays
-        X_raw = X_full.values.astype("float32")
-        y_raw = y_full.values.astype("float32").reshape(-1, 1)
-        idx_raw = common_idx.to_numpy()
+    # Align indices (important!)
+    train_df = train_df.loc[benchmark_train.index]
+    test_df = test_df.loc[benchmark_test.index]
 
-        # -----------------------------
-        # 3. Scale features using TRAIN only
-        # -----------------------------
-        train_mask_scaler = common_idx <= split_point_ts
-        X_train_raw_for_scaler = X_raw[train_mask_scaler]
-        y_train_raw_for_scaler = y_raw[train_mask_scaler]
+    # ------------------------------------------------------------------
+    # 2) Regularize exogenous variables with RidgeCV
+    # ------------------------------------------------------------------
+    # Ridge shrinks coefficients and combats overfitting from many exogs.
+    alphas = np.logspace(-4, 4, 20)  # wide range of penalty strengths
+    ridge = RidgeCV(alphas=alphas, cv=5)
 
-        scaler_X = StandardScaler()
-        scaler_y = StandardScaler()
+    ridge.fit(train_df, benchmark_train)
 
-        scaler_X.fit(X_train_raw_for_scaler)
-        scaler_y.fit(y_train_raw_for_scaler)
+    # Build a single regularized exogenous signal for SARIMAX
+    exog_train_reg = pd.Series(
+        ridge.predict(train_df),
+        index=train_df.index,
+        name="x_reg"
+    )
+    exog_test_reg = pd.Series(
+        ridge.predict(test_df),
+        index=test_df.index,
+        name="x_reg"
+    )
 
-        X_scaled = scaler_X.transform(X_raw)
-        y_scaled = scaler_y.transform(y_raw).flatten()  # 1D
+    exog_train = exog_train_reg.to_frame()
+    exog_test = exog_test_reg.to_frame()
 
-        # -----------------------------
-        # 4. Build sequences [samples, timesteps, features]
-        # -----------------------------
-        X_seq, y_seq, idx_seq = ModelData._build_lstm_sequences(
-            X_scaled, y_scaled, idx_raw, lookback
+    if print_model_parameters:
+        print("\nRidge regularization on exogenous features")
+        print("Chosen alpha (L2 strength):", ridge.alpha_)
+        print("Number of original exogs :", train_df.shape[1])
+        print("Now passing 1-dim exog to SARIMAX: 'x_reg'")
+
+    # ------------------------------------------------------------------
+    # 3) Grid search SARIMA orders via IC (AIC or BIC)
+    # ------------------------------------------------------------------
+    best_ic = np.inf
+    best_order = None
+    best_seasonal_order = None
+    best_res = None
+
+    for order in order_grid:
+        for seasonal_order in seasonal_order_grid:
+            try:
+                model = SARIMAX(
+                    benchmark_train,
+                    exog=exog_train,
+                    order=order,
+                    seasonal_order=seasonal_order,
+                    enforce_stationarity=True,
+                    enforce_invertibility=True,
+                )
+                res = model.fit(disp=False)
+
+                ic = res.bic if use_bic else res.aic
+
+                if ic < best_ic:
+                    best_ic = ic
+                    best_order = order
+                    best_seasonal_order = seasonal_order
+                    best_res = res
+
+            except Exception as e:
+                # Some configurations may fail to converge; skip them
+                continue
+
+    if best_res is None:
+        raise RuntimeError("No SARIMAX specification converged. "
+                           "Check order_grid/seasonal_order_grid.")
+
+    if print_model_parameters:
+        print("\nBest SARIMAX orders selected by {}:".format(
+            "BIC" if use_bic else "AIC"))
+        print("  order         =", best_order)
+        print("  seasonal_order=", best_seasonal_order)
+        print("  {} value      = {:.3f}".format(
+            "BIC" if use_bic else "AIC", best_ic))
+        print("\nSARIMAX summary (regularized exog):")
+        print(best_res.summary())
+
+    # ------------------------------------------------------------------
+    # 4) In-sample prediction (train) & out-of-sample forecast (test)
+    # ------------------------------------------------------------------
+    # In-sample fitted values for train set
+    predicted_train = best_res.predict(
+        start=benchmark_train.index[0],
+        end=benchmark_train.index[-1],
+        exog=exog_train
+    )
+
+    # Forecast for test set
+    forecast_test = best_res.predict(
+        start=benchmark_test.index[0],
+        end=benchmark_test.index[-1],
+        exog=exog_test
+    )
+
+    # Build result DataFrame for full period
+    result_train_df = pd.concat(
+        [predicted_train.rename("Predicted"),
+         benchmark_train.rename("Benchmark")],
+        axis=1
+    )
+    result_test_df = pd.concat(
+        [forecast_test.rename("Predicted"),
+         benchmark_test.rename("Benchmark")],
+        axis=1
+    )
+
+    result_df = pd.concat([result_train_df, result_test_df])
+    result_df = result_df.sort_index()
+
+    # ------------------------------------------------------------------
+    # 5) Plot comparison
+    # ------------------------------------------------------------------
+    if print_comparision_plot:
+        fig = result_df.plot()
+        fig.add_vline(
+            x=split_point,
+            line_width=2,
+            line_color="red",
+            line_dash="dash"
         )
+        fig.show()
 
-        # Now split again into train / test based on prediction time index
-        idx_seq_ts = pd.to_datetime(idx_seq)
-        train_mask = idx_seq_ts <= split_point_ts
+    # ------------------------------------------------------------------
+    # 6) Evaluation metrics
+    # ------------------------------------------------------------------
+    if print_evaluation_matrix:
+        # Train metrics
+        mse_train = mean_squared_error(benchmark_train, predicted_train)
+        rmse_train = sqrt(mse_train)
 
-        X_train_seq = X_seq[train_mask]
-        y_train_seq = y_seq[train_mask]
-        idx_train_seq = idx_seq_ts[train_mask]
+        # Test metrics
+        mse_test = mean_squared_error(benchmark_test, forecast_test)
+        rmse_test = sqrt(mse_test)
 
-        X_test_seq = X_seq[~train_mask]
-        y_test_seq = y_seq[~train_mask]
-        idx_test_seq = idx_seq_ts[~train_mask]
+        print("\nTraining vs Testing MSE:", mse_train, " >> ", mse_test)
+        print("Training vs Testing RMSE:", rmse_train, " >> ", rmse_test)
 
-        print(
-            f"LSTM: {X_train_seq.shape[0]} train samples, "
-            f"{X_test_seq.shape[0]} test samples, "
-            f"lookback={lookback}, features={X_full.shape[1]}"
+        # Overall correlations
+        valid_all = result_df.dropna()
+        pearson_overall = valid_all["Predicted"].corr(valid_all["Benchmark"])
+        spearman_overall, _ = spearmanr(
+            valid_all["Predicted"], valid_all["Benchmark"]
         )
+        print("\nPearson Correlation (Overall):")
+        print(pearson_overall)
+        print("Spearman Correlation (Overall):")
+        print(spearman_overall)
 
-        # -----------------------------
-        # 5. Define LSTM model
-        # -----------------------------
-        model = Sequential()
-        model.add(
-            LSTM(
-                units,
-                input_shape=(lookback, X_full.shape[1]),
-                return_sequences=False,
-            )
+        # Train correlations
+        train_corr_df = result_df.loc[:split_point].dropna()
+        pearson_train = train_corr_df["Predicted"].corr(
+            train_corr_df["Benchmark"]
         )
-        if dropout > 0:
-            model.add(Dropout(dropout))
-        model.add(Dense(1))
-
-        model.compile(optimizer="adam", loss="mse")
-
-        if print_model_parameters:
-            model.summary()
-
-        es = EarlyStopping(
-            monitor="val_loss",
-            patience=patience,
-            restore_best_weights=True,
+        spearman_train, _ = spearmanr(
+            train_corr_df["Predicted"], train_corr_df["Benchmark"]
         )
+        print("\nPearson Correlation (Train):")
+        print(pearson_train)
+        print("Spearman Correlation (Train):")
+        print(spearman_train)
 
-        history = model.fit(
-            X_train_seq,
-            y_train_seq,
-            validation_split=val_split,
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=[es],
-            verbose=verbose,
+        # Test correlations
+        test_corr_df = result_df.loc[result_df.index > split_point].dropna()
+        pearson_test = test_corr_df["Predicted"].corr(
+            test_corr_df["Benchmark"]
         )
+        spearman_test, _ = spearmanr(
+            test_corr_df["Predicted"], test_corr_df["Benchmark"]
+        )
+        print("\nPearson Correlation (Test):")
+        print(pearson_test)
+        print("Spearman Correlation (Test):")
+        print(spearman_test)
 
-        # -----------------------------
-        # 6. Predictions (in scaled space)
-        # -----------------------------
-        y_train_pred_scaled = model.predict(X_train_seq, verbose=0).flatten()
-        y_test_pred_scaled = model.predict(X_test_seq, verbose=0).flatten()
-
-        # Inverse transform to original scale
-        y_train_pred = scaler_y.inverse_transform(
-            y_train_pred_scaled.reshape(-1, 1)
-        ).flatten()
-        y_test_pred = scaler_y.inverse_transform(
-            y_test_pred_scaled.reshape(-1, 1)
-        ).flatten()
-
-        y_train_true = scaler_y.inverse_transform(
-            y_train_seq.reshape(-1, 1)
-        ).flatten()
-        y_test_true = scaler_y.inverse_transform(
-            y_test_seq.reshape(-1, 1)
-        ).flatten()
-
-        y_train_true_s = pd.Series(y_train_true, index=idx_train_seq)
-        y_train_pred_s = pd.Series(y_train_pred, index=idx_train_seq)
-
-        y_test_true_s = pd.Series(y_test_true, index=idx_test_seq)
-        y_test_pred_s = pd.Series(y_test_pred, index=idx_test_seq)
-
-        # Put into a single df like SARIMAX
-        result_train_df = pd.concat([y_train_pred_s, y_train_true_s], axis=1)
-        result_test_df = pd.concat([y_test_pred_s, y_test_true_s], axis=1)
-
-        result_df = pd.concat([result_train_df, result_test_df])
-        result_df.columns = ["Predicted", "Benchmark"]
-        result_df = result_df.loc[TIMEPOINTS.final_results_start_year:]
-
-        # -----------------------------
-        # 7. Optional comparison plot
-        # -----------------------------
-        if print_comparision_plot:
-            fig = result_df.plot(title="LSTM – Predicted vs Benchmark")
-            fig.add_vline(
-                x=split_point_ts,
-                line_width=2,
-                line_color="red",
-                line_dash="dash",
-            )
-            fig.show()
-
-        # -----------------------------
-        # 8. Optional evaluation metrics
-        # -----------------------------
-        if print_evaluation_matrix:
-            # Align to compute metrics
-            benchmark_train = result_df["Benchmark"].loc[:split_point_ts]
-            benchmark_test = result_df["Benchmark"].loc[split_point_ts:]
-
-            predicted_train = result_df["Predicted"].loc[benchmark_train.index]
-            predicted_test = result_df["Predicted"].loc[benchmark_test.index]
-
-            mse_train = mean_squared_error(benchmark_train, predicted_train)
-            mse_test = mean_squared_error(benchmark_test, predicted_test)
-            rmse_train = sqrt(mse_train)
-            rmse_test = sqrt(mse_test)
-
-            print(
-                "Training vs Testing MSE:",
-                mse_train,
-                ">>",
-                mse_test,
-            )
-            print(
-                "Training vs Testing RMSE:",
-                rmse_train,
-                ">>",
-                rmse_test,
-            )
-
-            print(
-                "Pearson Correlation\n",
-                result_df.corr(),
-            )
-
-        return result_df
+    return result_df
