@@ -1,56 +1,185 @@
-from statsmodels.tsa.seasonal import STL
-import pandas as pd
-import numpy as np
+class ModelData:
+    ...
+    @staticmethod
+    def apply_stlforecast(
+        train_df,
+        test_df,
+        benchmark,
+        split_point,
+        period=12,
+        arima_order=(1, 0, 0),
+        print_model_summary=False,
+        print_comparision_plot=True,
+        print_evaluation_matrix=True,
+    ):
+        """
+        STL + ARIMA forecaster with exogenous variables.
 
-@staticmethod
-def stl_deseasonal_single_series_no_leak(series, period, split_point, sts_return_model=False):
-    """
-    Applies STL decomposition using ONLY data up to split_point (train)
-    to estimate seasonality, then repeats that seasonal pattern over
-    the full index (train + test) to avoid data leakage.
+        - Fits STL + ARIMA only on the TRAIN period (<= split_point)
+        - STL handles seasonality (period), ARIMA handles deseasonalized series
+        - Seasonality for future is generated using the final STL seasonal cycle
+          (statsmodels STLForecast default behaviour – no leakage).
+        - Exogenous regressors (train_df / test_df) are used in the ARIMA part.
 
-    Args
-    ----
-    series : pd.Series
-        Full time series (train + test).
-    period : int
-        Seasonal period (e.g. 12 for monthly with yearly seasonality).
-    split_point : str or Timestamp
-        Date that separates train from test.
-    sts_return_model : bool
-        If True, also return the fitted STL object (for diagnostics).
+        Args
+        ----
+        train_df : pd.DataFrame or pd.Series
+            Exogenous variables for training period.
+        test_df : pd.DataFrame or pd.Series
+            Exogenous variables for testing period.
+        benchmark : pd.Series
+            Target series (e.g. your benchmark_input).
+        split_point : str or pd.Timestamp
+            Date separating train and test.
+        period : int
+            Seasonal period for STL (12 for monthly yearly seasonality).
+        arima_order : tuple
+            (p, d, q) order for the ARIMA model on the deseasonalized series.
+        print_model_summary : bool
+            If True, prints underlying ARIMA summary.
+        print_comparision_plot : bool
+            If True, plots Predicted vs Benchmark with vertical split line.
+        print_evaluation_matrix : bool
+            If True, prints MSE / RMSE and Pearson/Spearman for
+            overall, train, and test.
 
-    Returns
-    -------
-    deseasonalized : pd.Series
-        Deseasonalized version of `series` (full index), with seasonality
-        estimated only from train data.
-    """
-    series = series.sort_index()
-    split_point = pd.to_datetime(split_point)
+        Returns
+        -------
+        result_df : pd.DataFrame
+            DataFrame with 'Predicted' and 'Benchmark' over full period.
+        """
 
-    # 1) Restrict STL fit to TRAIN only (no future info)
-    series_train = series.loc[:split_point]
+        # ------------------------------
+        # 0) Basic cleanup & alignment
+        # ------------------------------
+        split_point = pd.to_datetime(split_point)
 
-    stl = STL(series_train, period=period, robust=True)
-    res = stl.fit()
-    seasonal_train = res.seasonal
+        # Ensure Series → DataFrame for exogs
+        if isinstance(train_df, pd.Series):
+            train_df = train_df.to_frame()
+        if isinstance(test_df, pd.Series):
+            test_df = test_df.to_frame()
 
-    # 2) Build a seasonal pattern (one full period) from the *end* of train
-    if len(seasonal_train) >= period:
-        base_pattern = seasonal_train.iloc[-period:].values  # last 12 months
-    else:
-        # If train is shorter than a full cycle, just use what we have
-        base_pattern = seasonal_train.values
+        # Sort everything by index just in case
+        benchmark = benchmark.sort_index()
+        train_df = train_df.sort_index()
+        test_df = test_df.sort_index()
 
-    # 3) Repeat this pattern across the full index (train + test)
-    full_idx = series.index
-    full_seasonal_values = np.tile(base_pattern, int(np.ceil(len(full_idx) / len(base_pattern))))[:len(full_idx)]
-    seasonal_full = pd.Series(full_seasonal_values, index=full_idx)
+        # First split benchmark by date
+        y_train = benchmark.loc[:split_point]
+        y_test = benchmark.loc[split_point:]
 
-    # 4) Deseasonalize using this *train-derived* seasonal term
-    deseasonalized = series - seasonal_full
+        # Align exogenous data to benchmark indices
+        X_train = train_df.loc[y_train.index.intersection(train_df.index)]
+        y_train = y_train.loc[X_train.index]
 
-    if sts_return_model:
-        return deseasonalized, stl
-    return deseasonalized
+        X_test = test_df.loc[y_test.index.intersection(test_df.index)]
+        y_test = y_test.loc[X_test.index]
+
+        # Sanity check
+        # print(len(X_train), len(y_train), len(X_test), len(y_test))
+
+        # --------------------------------
+        # 1) STLForecast (no leakage)
+        # --------------------------------
+        # STL is fitted only on y_train (and X_train), not on future data.
+        stlf = STLForecast(
+            endog=y_train,
+            exog=X_train,
+            period=period,
+            model=ARIMA,
+            model_kwargs={"order": arima_order},
+        )
+
+        stlf_res = stlf.fit()
+
+        if print_model_summary:
+            print(stlf_res.model_result.summary())
+
+        # In-sample fitted values for train
+        # (predict uses same STL + ARIMA, no future info)
+        predicted_train = stlf_res.predict(
+            start=y_train.index[0],
+            end=y_train.index[-1],
+            exog=X_train,
+        )
+
+        # Out-of-sample forecast for test horizon
+        forecast_test = stlf_res.forecast(
+            steps=len(y_test),
+            exog=X_test,
+        )
+
+        # --------------------------------
+        # 2) Combine results
+        # --------------------------------
+        result_train_df = pd.concat(
+            [predicted_train.rename("Predicted"), y_train.rename("Benchmark")],
+            axis=1,
+        )
+        result_test_df = pd.concat(
+            [forecast_test.rename("Predicted"), y_test.rename("Benchmark")],
+            axis=1,
+        )
+
+        result_df = pd.concat([result_train_df, result_test_df], axis=0)
+
+        # --------------------------------
+        # 3) Plot comparison
+        # --------------------------------
+        if print_comparision_plot:
+            fig = result_df.plot()
+            fig.axvline(
+                x=split_point,
+                linewidth=2,
+                color="red",
+                linestyle="dashed",
+            )
+
+        # --------------------------------
+        # 4) Evaluation metrics
+        # --------------------------------
+        if print_evaluation_matrix:
+            # MSE / RMSE
+            mse_train = mean_squared_error(
+                y_train, predicted_train.loc[y_train.index]
+            )
+            rmse_train = sqrt(mse_train)
+
+            mse_test = mean_squared_error(
+                y_test, forecast_test.loc[y_test.index]
+            )
+            rmse_test = sqrt(mse_test)
+
+            print("Training vs Testing MSE:", mse_train, " >> ", mse_test)
+            print("Training vs Testing RMSE:", rmse_train, " >> ", rmse_test)
+
+            # Overall correlations
+            valid_idx = result_df[["Predicted", "Benchmark"]].dropna().index
+            pred_all = result_df.loc[valid_idx, "Predicted"]
+            bench_all = result_df.loc[valid_idx, "Benchmark"]
+
+            print("Pearson Correlation (Overall):\n", pred_all.corr(bench_all))
+            if len(pred_all) > 1:
+                spear_overall, _ = spearmanr(pred_all, bench_all)
+                print("Spearman Correlation (Overall):\n", spear_overall)
+
+            # Train correlations
+            train_idx = result_train_df.dropna().index
+            pred_tr = result_train_df.loc[train_idx, "Predicted"]
+            bench_tr = result_train_df.loc[train_idx, "Benchmark"]
+            print("Pearson Correlation (Train):\n", pred_tr.corr(bench_tr))
+            if len(pred_tr) > 1:
+                spear_tr, _ = spearmanr(pred_tr, bench_tr)
+                print("Spearman Correlation (Train):\n", spear_tr)
+
+            # Test correlations
+            test_idx = result_test_df.dropna().index
+            pred_te = result_test_df.loc[test_idx, "Predicted"]
+            bench_te = result_test_df.loc[test_idx, "Benchmark"]
+            print("Pearson Correlation (Test):\n", pred_te.corr(bench_te))
+            if len(pred_te) > 1:
+                spear_te, _ = spearmanr(pred_te, bench_te)
+                print("Spearman Correlation (Test):\n", spear_te)
+
+        return result_df
