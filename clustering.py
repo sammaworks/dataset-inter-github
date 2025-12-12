@@ -1,46 +1,24 @@
-results = []
+import matplotlib.pyplot as plt
 
-# all sectors in the pivot
-sectors = df_transact_by_sector_custom.columns.get_level_values(0).unique()
+def plot_yoy_series(sector, macro_name, merged_yoy, w_debit, w_credit):
+    """
+    merged_yoy: DataFrame with columns ['X1','X2','Y']
+    """
 
-for sector in sectors:
-    # safely skip sectors that don't have both DEBIT and CREDIT
-    if 'DEBIT' not in df_transact_by_sector_custom[sector].columns or \
-       'CREDIT' not in df_transact_by_sector_custom[sector].columns:
-        continue
+    # Compute optimized combined YoY series
+    merged_yoy['Opt_Combined'] = w_debit * merged_yoy['X1'] + w_credit * merged_yoy['X2']
 
-    debit  = df_transact_by_sector_custom[sector]['DEBIT']
-    credit = df_transact_by_sector_custom[sector]['CREDIT']
-
-    # put the two together for easy alignment later
-    sector_df = pd.concat(
-        [debit.rename('DEBIT'), credit.rename('CREDIT')],
-        axis=1
-    )
-
-    for macro_name in macro_df.columns:
-        # align on common dates and drop NaNs
-        merged = pd.concat(
-            [sector_df, macro_df[macro_name].rename(macro_name)],
-            axis=1,
-            join='inner'
-        ).dropna()
-
-        if len(merged) < 3:   # not enough points to compute correlation robustly
-            continue
-
-        X1 = merged['DEBIT']
-        X2 = merged['CREDIT']
-        Y  = merged[macro_name]
-
-        w_debit, w_credit, corr = maximize_correlation(X1, X2, Y)
-
-        results.append({
-            'sector'           : sector,
-            'macro_indicator'  : macro_name,
-            'corr_with_Y'      : corr,
-            'weight_debit'     : w_debit,
-            'weight_credit'    : w_credit
-        })
-
-results_df = pd.DataFrame(results)
+    plt.figure(figsize=(12,6))
+    plt.plot(merged_yoy.index.to_timestamp(), merged_yoy['X1'], label='DEBIT YoY', linewidth=2)
+    plt.plot(merged_yoy.index.to_timestamp(), merged_yoy['X2'], label='CREDIT YoY', linewidth=2)
+    plt.plot(merged_yoy.index.to_timestamp(), merged_yoy['Y'], label=f'{macro_name} YoY', linewidth=2)
+    plt.plot(merged_yoy.index.to_timestamp(), merged_yoy['Opt_Combined'], 
+             label=f'Optimized ({w_debit:.2f},{w_credit:.2f})', 
+             linewidth=3, linestyle='--')
+    
+    plt.title(f"YoY Series: {sector} vs {macro_name}")
+    plt.xlabel("Date")
+    plt.ylabel("YoY % Change")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
