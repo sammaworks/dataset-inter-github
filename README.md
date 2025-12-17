@@ -1,188 +1,209 @@
-# app/models/models.py
-from __future__ import annotations
+Great question — this is an **important modelling concept**, and it often makes a **bigger difference than standardizing** when your exogenous variables are noisy.
 
-from typing import List, Optional
-from sqlalchemy import (
-    BigInteger,
-    Column,
-    DateTime,
-    ForeignKey,
-    ForeignKeyConstraint,
-    Index,
-    Integer,
-    PrimaryKeyConstraint,
-    String,
-    UniqueConstraint,
-    func,
-    text,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+I’ll explain it **intuitively**, then **statistically**, then show **exact code** (leakage-safe).
 
+---
 
-# ---------- Base ----------
-class Base(DeclarativeBase):
-    pass
+## 1️⃣ What does “spiky exogs” mean in your case?
 
+Your FG %-change series looks like this (from your plots):
 
-# ---------- RepoInfo ----------
-class RepoInfo(Base):
-    __tablename__ = "repo_info"
+* Many small month-to-month changes
+* **Occasional very large jumps** (±20%, ±30%, even more)
+* These jumps are often:
 
-    # Single autoincrement PK so other tables can reference it cleanly
-    repo_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
+  * promotions
+  * reporting artefacts
+  * calendar effects
+  * one-off shocks
 
-    # Business keys
-    repo_url: Mapped[str] = mapped_column(String, nullable=False)
-    local_path: Mapped[str] = mapped_column(String, nullable=False)
+These are **outliers**, not the “typical” demand signal.
 
-    # Metadata
-    latest_repo_snapshot: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    created_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),    # DB-side default (UTC on Postgres if server tz is UTC)
-        nullable=False,
-    )
-    updated_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+---
 
-    # (repo_url, local_path) must be unique
-    __table_args__ = (
-        UniqueConstraint("repo_url", "local_path", name="repo_info_url_path_uc"),
-        Index("ix_repo_info_url", "repo_url"),
-        Index("ix_repo_info_local_path", "local_path"),
-    )
+## 2️⃣ Why standardizing does NOT fix this
 
-    # Relationships
-    sessions: Mapped[List["Session"]] = relationship(
-        back_populates="repo",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+### What standardization does
 
-    histories: Mapped[List["RepoHistory"]] = relationship(
-        back_populates="repo",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+Standardization (z-score):
 
+[
+x_{\text{std}} = \frac{x - \mu}{\sigma}
+]
 
-# ---------- Session ----------
-class Session(Base):
-    __tablename__ = "sessions"
+This:
 
-    session_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
+* rescales values
+* centers them at 0
+* **does NOT remove outliers**
 
-    # Each session belongs to a repo
-    repo_id: Mapped[int] = mapped_column(
-        ForeignKey("repo_info.repo_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
+⚠️ In fact:
 
-    created_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+* extreme values remain extreme
+* they still dominate likelihood estimation
+* they can distort ARMA + exog coefficient estimation
 
-    # Relationships
-    repo: Mapped["RepoInfo"] = relationship(back_populates="sessions")
+So after standardization:
 
-    commands: Mapped[List["CommandHistory"]] = relationship(
-        back_populates="session",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+* a +40% FG spike is still a **huge leverage point**
+* SARIMAX will try to “explain” that spike
+* forecasts degrade
 
+---
 
-# ---------- RepoHistory ----------
-class RepoHistory(Base):
-    __tablename__ = "repo_history"
+## 3️⃣ What winsorization does (key idea)
 
-    # Composite primary key: (repo_id, commit_hash)
-    repo_id: Mapped[int] = mapped_column(
-        ForeignKey("repo_info.repo_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-    commit_hash: Mapped[str] = mapped_column(String, nullable=False)
+**Winsorization caps extreme values** instead of rescaling everything.
 
-    repo_snapshot: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    created_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+Example (1%–99% winsorization):
 
-    __table_args__ = (
-        PrimaryKeyConstraint("repo_id", "commit_hash", name="repo_history_pk"),
-        Index("ix_repo_history_commit", "commit_hash"),
-    )
+* Any value below 1st percentile → set to 1st percentile
+* Any value above 99th percentile → set to 99th percentile
+* All other values remain unchanged
 
-    # Relationships
-    repo: Mapped["RepoInfo"] = relationship(back_populates="histories")
+So:
 
-    commands: Mapped[List["CommandHistory"]] = relationship(
-        back_populates="repo_history",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+* extreme spikes are **tamed**
+* normal variation is preserved
+* time structure is not broken
 
+This is **much better for macro + retail series**.
 
-# ---------- CommandHistory ----------
-class CommandHistory(Base):
-    __tablename__ = "command_history"
+---
 
-    command_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
+## 4️⃣ Why winsorization works better for SARIMAX
 
-    # Link to the session that issued the command
-    session_id: Mapped[int] = mapped_column(
-        ForeignKey("sessions.session_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
+SARIMAX assumes:
 
-    command: Mapped[str] = mapped_column(String, nullable=False)
-    output: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+* roughly Gaussian residuals
+* linear response to exogs
 
-    # Link to a precise repo state via the composite key (repo_id, commit_hash)
-    repo_id: Mapped[int] = mapped_column(nullable=False)
-    commit_hash: Mapped[str] = mapped_column(String, nullable=False)
+Extreme FG spikes:
 
-    executed_at: Mapped[str] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+* violate Gaussian assumptions
+* cause coefficient instability
+* inflate AR terms
+* reduce forecast accuracy
 
-    __table_args__ = (
-        # Composite FK to repo_history(repo_id, commit_hash)
-        ForeignKeyConstraint(
-            ["repo_id", "commit_hash"],
-            ["repo_history.repo_id", "repo_history.commit_hash"],
-            ondelete="CASCADE",
-            name="fk_command_repo_history",
-        ),
-        Index("ix_command_history_session_id", "session_id"),
-        Index("ix_command_history_repo_commit", "repo_id", "commit_hash"),
-    )
+Winsorization:
 
-    # Relationships
-    session: Mapped["Session"] = relationship(back_populates="commands")
-    repo_history: Mapped["RepoHistory"] = relationship(back_populates="commands")
+* improves residual normality
+* stabilizes coefficients
+* improves out-of-sample RMSE more than scaling
+
+That’s why many applied macro/energy/retail papers do this.
+
+---
+
+## 5️⃣ VERY IMPORTANT: avoid data leakage
+
+You must:
+
+* compute winsorization thresholds **on training data only**
+* apply the same caps to test data
+
+Never compute percentiles on the full dataset.
+
+---
+
+## 6️⃣ Correct, leakage-safe winsorization code (use this)
+
+### Step 1: define a winsorization function
+
+```python
+def winsorize_series(s, lower_q=0.01, upper_q=0.99):
+    lo = s.quantile(lower_q)
+    hi = s.quantile(upper_q)
+    return s.clip(lower=lo, upper=hi), lo, hi
+```
+
+---
+
+### Step 2: fit caps on TRAIN only
+
+```python
+exog_cols = [
+    'FG1_ONLINE_pctchange_lag2',
+    'FG1_OFFLINE_pctchange_lag2',
+    'FG1_ONLINE_pctchange_roll3',
+    'FG1_OFFLINE_pctchange_roll3'
+]
+
+train_exog = train_df[exog_cols].copy()
+test_exog  = test_df[exog_cols].copy()
+
+winsor_limits = {}
+
+for col in exog_cols:
+    train_exog[col], lo, hi = winsorize_series(train_exog[col])
+    winsor_limits[col] = (lo, hi)
+```
+
+---
+
+### Step 3: apply SAME caps to test data
+
+```python
+for col, (lo, hi) in winsor_limits.items():
+    test_exog[col] = test_exog[col].clip(lower=lo, upper=hi)
+```
+
+Now:
+
+* train and test are treated consistently
+* no future information leaked
+
+---
+
+## 7️⃣ How winsorization changes your model behavior
+
+After winsorization, you’ll usually see:
+
+* smaller but **more stable coefficients**
+* fewer covariance warnings
+* AR coefficient slightly lower (less forced persistence)
+* better **test RMSE / MAE**
+* cleaner residual diagnostics
+
+Even if AIC worsens slightly, **forecast accuracy often improves**.
+
+---
+
+## 8️⃣ Should you still standardize after winsorizing?
+
+You can, but it’s optional.
+
+Best practice order:
+
+1. **Winsorize**
+2. (Optional) Standardize
+3. Fit SARIMAX
+
+If you standardize **without winsorizing**, outliers still dominate.
+
+---
+
+## 9️⃣ When winsorization is NOT appropriate
+
+Do NOT winsorize if:
+
+* spikes are the phenomenon you want to model (e.g., crisis detection)
+* you’re doing causal inference on extreme shocks
+
+But for **forecasting inflation using retail demand** → winsorization is appropriate.
+
+---
+
+## 10️⃣ Simple intuition summary (one sentence)
+
+> Standardization rescales spikes; winsorization removes their leverage — and leverage is what breaks SARIMAX.
+
+---
+
+If you want, next I can:
+
+* add winsorization + standardization cleanly into your existing notebook
+* show **before vs after** RMSE comparison
+* help you decide optimal percentile (1–99 vs 2–98)
+
+Just tell me 👍
